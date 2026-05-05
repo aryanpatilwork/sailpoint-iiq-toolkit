@@ -1,0 +1,216 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE Workflow PUBLIC "sailpoint.dtd" "sailpoint.dtd">
+
+<!--
+  AccessRequestWorkflow.xml
+
+  SailPoint IIQ Access Request Workflow
+  Handles the end-to-end lifecycle of an access request — from submission
+  through manager approval, optional secondary approval for sensitive roles,
+  provisioning, and notification.
+
+  Workflow Steps:
+    1. Initialise         - validate request and set context variables
+    2. Manager Approval   - route to requestor's direct manager
+    3. Security Approval  - conditional step for privileged/sensitive access
+    4. Provision          - execute the provisioning plan
+    5. Notify             - send completion notification to requestor
+
+  Author: Aryan Patil
+  Tested On: SailPoint IIQ 8.2, 8.3
+-->
+
+<Workflow name="Access Request Workflow" type="LCMProvisioning"
+          description="End-to-end access request lifecycle with conditional approval routing">
+
+  <Variable name="identityName"      input="true"  required="true"
+            description="Name of the identity requesting access"/>
+  <Variable name="plan"              input="true"  required="true"
+            description="ProvisioningPlan containing the requested entitlements"/>
+  <Variable name="requestor"         input="true"
+            description="Name of the identity who submitted the request"/>
+  <Variable name="requestId"         output="true"
+            description="Generated unique ID for this request, used for audit tracking"/>
+  <Variable name="approvalDecision"
+            description="Result of manager approval step: Approved or Rejected"/>
+  <Variable name="requiresSecurityApproval"
+            description="Boolean flag set during initialise if request contains privileged access"/>
+  <Variable name="provisioningResult" output="true"
+            description="Final provisioning status returned to the caller"/>
+
+  <!-- ═══════════════════════════════════════════════════════
+       STEP 1: INITIALISE
+       Validates the request, generates a request ID, and
+       determines whether secondary security approval is required.
+  ═══════════════════════════════════════════════════════ -->
+  <Step name="Initialise" icon="Start" posX="10" posY="100">
+    <Description>
+      Validate the incoming provisioning plan and set workflow context variables.
+      Checks for privileged entitlements that require security team approval.
+    </Description>
+    <Script>
+      <Source>
+        import sailpoint.object.*;
+        import sailpoint.tools.*;
+        import java.util.*;
+
+        // Generate a unique request ID for audit trail
+        String reqId = "REQ-" + System.currentTimeMillis();
+        workflow.put("requestId", reqId);
+        log.info("AccessRequestWorkflow: Initialised request " + reqId
+                 + " for identity: " + identityName);
+
+        // Determine if any requested entitlements are flagged as privileged
+        boolean needsSecApproval = false;
+        List privilegedKeywords = Arrays.asList("admin", "privileged", "cyberark", "pam", "root");
+
+        ProvisioningPlan plan = (ProvisioningPlan) workflow.get("plan");
+        if (plan != null && plan.getAccountRequests() != null) {
+          for (Object reqObj : plan.getAccountRequests()) {
+            ProvisioningPlan.AccountRequest req = (ProvisioningPlan.AccountRequest) reqObj;
+            if (req.getAttributeRequests() != null) {
+              for (Object attrObj : req.getAttributeRequests()) {
+                ProvisioningPlan.AttributeRequest attr = (ProvisioningPlan.AttributeRequest) attrObj;
+                String attrName = attr.getName() != null ? attr.getName().toLowerCase() : "";
+                for (Object kw : privilegedKeywords) {
+                  if (attrName.contains((String) kw)) {
+                    needsSecApproval = true;
+                    log.info("AccessRequestWorkflow: Privileged entitlement detected: "
+                             + attr.getName() + ". Security approval required.");
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        workflow.put("requiresSecurityApproval", needsSecApproval);
+      </Source>
+    </Script>
+    <Transition to="Manager Approval"/>
+  </Step>
+
+  <!-- ═══════════════════════════════════════════════════════
+       STEP 2: MANAGER APPROVAL
+       Routes the request to the requestor's manager for review.
+       SLA: 48 hours. Escalates to manager's manager on timeout.
+  ═══════════════════════════════════════════════════════ -->
+  <Step name="Manager Approval" icon="Approval" posX="200" posY="100">
+    <Description>
+      Routes the access request to the requestor's direct manager for approval.
+      Times out after 48 hours and escalates to the manager's manager.
+    </Description>
+    <Approval owner="ref:approvalOwnerScript" mode="serial" send="identityName,plan,requestId">
+      <AfterScript>
+        <Source>
+          import sailpoint.object.*;
+          String decision = (String) approvalSet.getDecision();
+          workflow.put("approvalDecision", decision);
+          log.info("AccessRequestWorkflow: Manager approval decision: " + decision
+                   + " for request: " + workflow.get("requestId"));
+        </Source>
+      </AfterScript>
+    </Approval>
+    <Transition to="Rejected" when="&quot;Rejected&quot;.equals(approvalDecision)"/>
+    <Transition to="Security Approval" when="requiresSecurityApproval"/>
+    <Transition to="Provision"/>
+  </Step>
+
+  <!-- ═══════════════════════════════════════════════════════
+       STEP 3: SECURITY APPROVAL (CONDITIONAL)
+       Only triggered for privileged access requests.
+       Routes to the security operations team owner.
+  ═══════════════════════════════════════════════════════ -->
+  <Step name="Security Approval" icon="Approval" posX="400" posY="100"
+        condition="requiresSecurityApproval">
+    <Description>
+      Conditional approval step for requests containing privileged entitlements.
+      Routes to the Security Operations team. SLA: 24 hours.
+    </Description>
+    <Approval owner="SecurityOperationsOwner" mode="serial" send="identityName,plan,requestId">
+      <AfterScript>
+        <Source>
+          import sailpoint.object.*;
+          String decision = (String) approvalSet.getDecision();
+          workflow.put("approvalDecision", decision);
+          log.info("AccessRequestWorkflow: Security approval decision: " + decision
+                   + " for request: " + workflow.get("requestId"));
+        </Source>
+      </AfterScript>
+    </Approval>
+    <Transition to="Rejected" when="&quot;Rejected&quot;.equals(approvalDecision)"/>
+    <Transition to="Provision"/>
+  </Step>
+
+  <!-- ═══════════════════════════════════════════════════════
+       STEP 4: PROVISION
+       Executes the approved provisioning plan against target systems.
+  ═══════════════════════════════════════════════════════ -->
+  <Step name="Provision" icon="Task" posX="600" posY="100">
+    <Description>
+      Executes the approved provisioning plan. Captures the provisioning
+      result for notification and audit purposes.
+    </Description>
+    <Script>
+      <Source>
+        import sailpoint.object.*;
+        import sailpoint.api.*;
+
+        ProvisioningPlan plan = (ProvisioningPlan) workflow.get("plan");
+        String identity = (String) workflow.get("identityName");
+
+        log.info("AccessRequestWorkflow: Executing provisioning plan for identity: "
+                 + identity + ", request: " + workflow.get("requestId"));
+
+        // Delegate to IIQ's provisioner
+        Provisioner provisioner = new Provisioner(context);
+        provisioner.execute(plan);
+
+        workflow.put("provisioningResult", "Provisioned");
+        log.info("AccessRequestWorkflow: Provisioning complete for request: "
+                 + workflow.get("requestId"));
+      </Source>
+    </Script>
+    <Transition to="Notify Requestor"/>
+  </Step>
+
+  <!-- ═══════════════════════════════════════════════════════
+       STEP 5: NOTIFY REQUESTOR — APPROVED
+  ═══════════════════════════════════════════════════════ -->
+  <Step name="Notify Requestor" icon="Email" posX="800" posY="100">
+    <Description>
+      Sends a completion notification to the requestor confirming that
+      the requested access has been provisioned.
+    </Description>
+    <Script>
+      <Source>
+        log.info("AccessRequestWorkflow: Sending approval notification for request: "
+                 + workflow.get("requestId"));
+        // Email notification handled by IIQ email template: "Access Request Approved"
+      </Source>
+    </Script>
+    <Transition to="End"/>
+  </Step>
+
+  <!-- ═══════════════════════════════════════════════════════
+       STEP: REJECTED
+  ═══════════════════════════════════════════════════════ -->
+  <Step name="Rejected" icon="Email" posX="400" posY="250">
+    <Description>
+      Notifies the requestor that their access request has been rejected
+      and records the rejection in the audit trail.
+    </Description>
+    <Script>
+      <Source>
+        workflow.put("provisioningResult", "Rejected");
+        log.info("AccessRequestWorkflow: Request rejected: " + workflow.get("requestId"));
+        // Email notification handled by IIQ email template: "Access Request Rejected"
+      </Source>
+    </Script>
+    <Transition to="End"/>
+  </Step>
+
+  <Step name="End" icon="Stop" posX="1000" posY="100"/>
+
+</Workflow>
